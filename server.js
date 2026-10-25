@@ -1,15 +1,21 @@
 // scan-server: backend for scan.mandylion.co.il
-// File hash lookup + SMS link check via VirusTotal, SMS phishing analysis via Groq
+// File hash lookup + optional full file scan + SMS link check via VirusTotal, SMS phishing analysis via Groq
 
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const VT_API_KEY = process.env.VT_API_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MODEL = 'openai/gpt-oss-120b';
+const VT_BASE = process.env.VT_BASE || 'https://www.virustotal.com/api/v3';
+
+// Full file upload limits (VirusTotal direct upload accepts up to 32MB)
+const UPLOAD_MAX_MB = 32;
+const UPLOADS_PER_DAY = Number(process.env.UPLOADS_PER_DAY) || 40;
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://scan.mandylion.co.il')
   .split(',')
@@ -29,6 +35,15 @@ const apiLimiter = rateLimit({
   message: { error: 'יותר מדי בדיקות ברצף. נסו שוב בעוד דקה.' }
 });
 app.use('/api/', apiLimiter);
+
+// Stricter limit for full file uploads
+const uploadLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 3,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'אפשר לשלוח עד 3 קבצים לסריקה מלאה בכל 10 דקות. נסו שוב מאוחר יותר.' }
+});
 
 // ---------- Cache ----------
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -63,6 +78,8 @@ const VT_PER_DAY = 490;
 const vtCalls = [];
 let vtDay = '';
 let vtDayCount = 0;
+let uploadDay = '';
+let uploadDayCount = 0;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -98,7 +115,7 @@ async function vtGet(path) {
   if (!VT_API_KEY) throw new Error('VT_API_KEY is missing');
   await vtReserveSlot();
 
-  const res = await fetch(`https://www.virustotal.com/api/v3${path}`, {
+  const res = await fetch(`${VT_BASE}${path}`, {
     headers: { 'x-apikey': VT_API_KEY },
     signal: AbortSignal.timeout(15000)
   });
@@ -109,6 +126,39 @@ async function vtGet(path) {
   }
   if (!res.ok) throw new Error(`VirusTotal error ${res.status}`);
   return res.json();
+}
+
+async function vtUploadFile(buffer, fileName) {
+  if (!VT_API_KEY) throw new Error('VT_API_KEY is missing');
+  await vtReserveSlot();
+
+  const form = new FormData();
+  form.append('file', new Blob([buffer]), fileName);
+
+  const res = await fetch(`${VT_BASE}/files`, {
+    method: 'POST',
+    headers: { 'x-apikey': VT_API_KEY },
+    body: form,
+    signal: AbortSignal.timeout(120000)
+  });
+
+  if (res.status === 429) {
+    throw new QuotaError('המכסה של VirusTotal נוצלה. נסו שוב בעוד דקה.', 60);
+  }
+  if (!res.ok) throw new Error(`VirusTotal upload error ${res.status}`);
+  return res.json();
+}
+
+function uploadReserve() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== uploadDay) {
+    uploadDay = today;
+    uploadDayCount = 0;
+  }
+  if (uploadDayCount >= UPLOADS_PER_DAY) {
+    throw new QuotaError('המכסה היומית לסריקות מלאות נגמרה. נסו שוב מחר.', 3600);
+  }
+  uploadDayCount++;
 }
 
 // ---------- Helpers ----------
@@ -131,6 +181,13 @@ function unixToIso(sec) {
   return sec ? new Date(sec * 1000).toISOString() : null;
 }
 
+function safeFileName(raw) {
+  let name = 'file';
+  try { name = decodeURIComponent(String(raw || 'file')); } catch { name = 'file'; }
+  name = name.replace(/[\\/\r\n"]/g, '_').slice(0, 120);
+  return name || 'file';
+}
+
 const VERDICT_RANK = { clean: 0, safe: 0, unknown: 0, suspicious: 1, dangerous: 2 };
 
 // ---------- Health ----------
@@ -139,7 +196,8 @@ app.get(['/', '/health'], (req, res) => {
     ok: true,
     vt: Boolean(VT_API_KEY),
     groq: Boolean(GROQ_API_KEY),
-    vtCallsToday: vtDayCount
+    vtCallsToday: vtDayCount,
+    uploadsToday: uploadDayCount
   });
 });
 
@@ -179,6 +237,77 @@ app.get('/api/hash/:hash', async (req, res, next) => {
     }
 
     cacheSet(key, result);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------- Full file scan: upload (only with the user's explicit consent in the UI) ----------
+app.post(
+  '/api/upload',
+  uploadLimiter,
+  express.raw({ type: 'application/octet-stream', limit: `${UPLOAD_MAX_MB}mb` }),
+  async (req, res, next) => {
+    try {
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        return res.status(400).json({ error: 'לא התקבל קובץ.' });
+      }
+
+      const fileName = safeFileName(req.get('X-File-Name'));
+      const sha256 = crypto.createHash('sha256').update(req.body).digest('hex');
+
+      uploadReserve();
+      const data = await vtUploadFile(req.body, fileName);
+      const analysisId = data && data.data && data.data.id;
+      if (!analysisId) throw new Error('VirusTotal upload returned no analysis id');
+
+      cache.delete(`file:${sha256}`);
+      res.json({ analysisId, sha256 });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ---------- Full file scan: poll analysis ----------
+app.get('/api/analysis/:id', async (req, res, next) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!/^[A-Za-z0-9+/_=:-]{10,200}$/.test(id)) {
+      return res.status(400).json({ error: 'מזהה סריקה לא תקין.' });
+    }
+
+    const key = `analysis:${id}`;
+    const cached = cacheGet(key);
+    if (cached) return res.json({ ...cached, cached: true });
+
+    const data = await vtGet(`/analyses/${encodeURIComponent(id)}`);
+    if (!data) return res.status(404).json({ error: 'הסריקה לא נמצאה.' });
+
+    const a = data.data.attributes || {};
+    const sha256 = data.meta && data.meta.file_info && data.meta.file_info.sha256;
+
+    if (a.status !== 'completed') {
+      return res.json({ done: false, status: a.status || 'queued' });
+    }
+
+    const result = {
+      done: true,
+      status: 'completed',
+      found: true,
+      fresh: true,
+      sha256: sha256 || null,
+      hash: sha256 || null,
+      stats: a.stats || {},
+      verdict: verdictFromStats(a.stats),
+      detections: topDetections(a.results),
+      lastAnalysis: unixToIso(a.date),
+      link: sha256 ? `https://www.virustotal.com/gui/file/${sha256}` : null
+    };
+
+    cacheSet(key, result);
+    if (sha256) cache.delete(`file:${sha256}`);
     res.json(result);
   } catch (err) {
     next(err);
@@ -385,7 +514,10 @@ app.use((err, req, res, next) => {
     return res.status(429).json({ error: err.message, retryAfter: err.retryAfterSec });
   }
   if (err.type === 'entity.too.large') {
-    return res.status(413).json({ error: 'ההודעה ארוכה מדי.' });
+    const msg = req.path === '/api/upload'
+      ? `הקובץ גדול מ-${UPLOAD_MAX_MB}MB, ולכן אי אפשר לשלוח אותו לסריקה מלאה.`
+      : 'ההודעה ארוכה מדי.';
+    return res.status(413).json({ error: msg });
   }
   console.error(err);
   res.status(500).json({ error: 'משהו השתבש בשרת. נסו שוב.' });
